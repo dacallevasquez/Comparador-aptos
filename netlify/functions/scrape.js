@@ -38,58 +38,72 @@ exports.handler = async (event) => {
       pageHTML = "";
     }
 
-    // Step 2: Try regex extraction first
+    // Step 2: Regex extraction
+    let regexData = {};
     if (pageHTML.length > 500) {
-      const regexData = extractWithRegex(pageHTML, url);
-      
-      // If regex got good data (at least price OR area+rooms), return it
-      if (regexData && (regexData.valorLista > 1000000 || (regexData.areaTotal > 0 && regexData.habitaciones > 0))) {
-        return { statusCode: 200, headers, body: JSON.stringify({ success: true, data: regexData }) };
-      }
+      regexData = extractWithRegex(pageHTML, url) || {};
     }
 
-    // Step 3: Send to Claude for parsing (without web_search)
+    // Step 3: ALWAYS send to Claude to complement regex data
     const htmlChunk = pageHTML.length > 500 ? pageHTML.substring(0, 20000) : "";
-    const prompt = htmlChunk 
-      ? "Analiza este HTML de un inmueble en venta y extrae todos los datos. Busca precios, áreas, habitaciones, baños, estrato, administración, etc. en el HTML, scripts, JSON-LD, metatags, o cualquier parte del código:\n\n" + htmlChunk
-      : "No pude obtener el HTML de " + url + ". Intenta deducir datos de la URL.";
-
-    const response = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-api-key": apiKey,
-        "anthropic-version": "2023-06-01",
-      },
-      body: JSON.stringify({
-        model: "claude-sonnet-4-20250514",
-        max_tokens: 1500,
-        system: "Extrae datos del inmueble. Responde SOLO con JSON puro sin backticks. Busca precios en formato colombiano (ej: 1.370.000.000 = mil trescientos setenta millones). Los precios en Colombia suelen estar entre 100.000.000 y 5.000.000.000 COP.",
-        messages: [{ role: "user", content: prompt + '\n\nResponde SOLO este JSON: {"nombre":"","foto":"","direccion":"","ciudad":"","barrio":"","tipo":"Apartamento","areaTotal":0,"areaPrivada":0,"estrato":0,"piso":0,"antiguedad":0,"habitaciones":0,"banos":0,"parqueaderos":0,"deposito":"No","vista":"Exterior","estado":"Original","valorLista":0,"adminMensual":0,"predialAnual":0,"amenidades":"","descripcion":""}' }]
-      })
-    });
-
-    const data = await response.json();
-    if (data.type === "error") {
-      return { statusCode: 200, headers, body: JSON.stringify({ success: false, error: JSON.stringify(data.error) }) };
-    }
-
-    let allText = "";
-    if (data.content) {
-      for (const block of data.content) {
-        if (block.type === "text") allText += block.text;
-      }
-    }
-
-    const clean = allText.replace(/```json/g, "").replace(/```/g, "").trim();
-    const match = clean.match(/\{[\s\S]*\}/);
-    if (match) {
+    
+    if (htmlChunk) {
       try {
-        const parsed = JSON.parse(match[0]);
-        return { statusCode: 200, headers, body: JSON.stringify({ success: true, data: parsed }) };
+        const alreadyFound = JSON.stringify(regexData);
+        const response = await fetch("https://api.anthropic.com/v1/messages", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "x-api-key": apiKey,
+            "anthropic-version": "2023-06-01",
+          },
+          body: JSON.stringify({
+            model: "claude-sonnet-4-20250514",
+            max_tokens: 1500,
+            system: "Eres un experto extractor de datos inmobiliarios colombianos. Analiza el HTML y extrae TODOS los datos del inmueble. Busca en scripts, JSON, metatags, texto visible, data-attributes, TODA la información. Los precios colombianos usan puntos como separador de miles (ej: 1.370.000.000). La administración suele estar entre 100.000 y 2.000.000 COP/mes. El estrato va de 1 a 6. Responde SOLO con JSON puro sin backticks.",
+            messages: [{ role: "user", content: "Extrae datos de este inmueble del HTML.\n\nDatos ya encontrados por regex: " + alreadyFound + "\n\nCompleta o corrige los datos faltantes (especialmente: precio, estrato, administración, dirección).\n\nHTML:\n" + htmlChunk + '\n\nResponde SOLO JSON: {"nombre":"","foto":"","direccion":"","ciudad":"","barrio":"","tipo":"Apartamento","areaTotal":0,"areaPrivada":0,"estrato":0,"piso":0,"antiguedad":0,"habitaciones":0,"banos":0,"parqueaderos":0,"deposito":"No","vista":"Exterior","estado":"Original","valorLista":0,"adminMensual":0,"predialAnual":0,"amenidades":"","descripcion":""}' }]
+          })
+        });
+
+        const data = await response.json();
+        if (data.content) {
+          let allText = "";
+          for (const block of data.content) {
+            if (block.type === "text") allText += block.text;
+          }
+          const clean = allText.replace(/```json/g, "").replace(/```/g, "").trim();
+          const match = clean.match(/\{[\s\S]*\}/);
+          if (match) {
+            try {
+              const claudeData = JSON.parse(match[0]);
+              // Merge: use regex data as base, Claude fills gaps
+              const merged = { ...regexData };
+              for (const key of Object.keys(claudeData)) {
+                const cv = claudeData[key];
+                const rv = merged[key];
+                // Use Claude's value if regex didn't find anything useful
+                if (cv && cv !== "" && cv !== 0 && cv !== "No" && cv !== "Exterior" && cv !== "Original" && cv !== "Apartamento") {
+                  if (!rv || rv === "" || rv === 0 || rv === "No" || rv === "Exterior" || rv === "Original") {
+                    merged[key] = cv;
+                  }
+                }
+                // For price: prefer the larger value (more likely correct)
+                if (key === "valorLista" && Number(cv) > 0 && Number(rv) > 0) {
+                  merged[key] = Math.max(Number(cv), Number(rv));
+                }
+              }
+              return { statusCode: 200, headers, body: JSON.stringify({ success: true, data: merged }) };
+            } catch (e) {}
+          }
+        }
       } catch (e) {
-        return { statusCode: 200, headers, body: JSON.stringify({ success: false, error: "JSON parse error" }) };
+        // Claude failed, fall through to regex-only
       }
+    }
+
+    // Fallback: return regex data alone
+    if (regexData && Object.keys(regexData).length > 0) {
+      return { statusCode: 200, headers, body: JSON.stringify({ success: true, data: regexData }) };
     }
 
     return { statusCode: 200, headers, body: JSON.stringify({ success: false, error: "No data extracted" }) };
